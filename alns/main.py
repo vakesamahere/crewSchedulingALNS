@@ -19,6 +19,7 @@ import math
 import copy
 from datetime import datetime, timedelta
 from typing import List, Dict, Set, Tuple, Optional, Any
+from gurobi_repair_solver import GurobiRepairSolver, RepairInput, RepairResult
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,54 +48,54 @@ class ALNSSolution:
         self.ground_duty_coverage_rate = None
         self.is_feasible = True
         self.violations = []
-
         # 计算目标函数值
         self._calculate_objective()
 
+
     def _calculate_objective(self):
-        """计算目标函数值"""
-        # 使用与main.py相同的线性目标函数
-        total_flight_hours = 0.0
-        total_duty_days = 0.0
-        covered_flights = set()
-        covered_ground_duties = set()
+            """计算目标函数值"""
+            # 使用与main.py相同的线性目标函数
+            total_flight_hours = 0.0
+            total_duty_days = 0.0
+            covered_flights = set()
+            covered_ground_duties = set()
 
-        roster_cost_sum = 0
-        for roster in self.rosters:
-            # 计算roster成本（使用统一配置的参数）
-            flight_reward = 0
-            positioning_penalty = 0
-            overnight_penalty = 0
+            roster_cost_sum = 0
+            for roster in self.rosters:
+                # 计算roster成本（使用统一配置的参数）
+                flight_reward = 0
+                positioning_penalty = 0
+                overnight_penalty = 0
 
-            for duty in roster.duties:
-                if isinstance(duty, Flight):
-                    covered_flights.add(duty.id)
-                    if hasattr(duty, 'flyTime') and duty.flyTime:
-                        flight_time_hours = duty.flyTime / 60.0
-                        flight_reward += flight_time_hours * UnifiedConfig.FLIGHT_TIME_REWARD
-                        total_flight_hours += flight_time_hours
-                    total_duty_days += 1
-                elif hasattr(duty, 'crewId') and hasattr(duty, 'airport'):
-                    covered_ground_duties.add(duty.id)
-                    total_duty_days += 1
+                for duty in roster.duties:
+                    if isinstance(duty, Flight):
+                        covered_flights.add(duty.id)
+                        if hasattr(duty, 'flyTime') and duty.flyTime:
+                            flight_time_hours = duty.flyTime / 60.0
+                            flight_reward += flight_time_hours * UnifiedConfig.FLIGHT_TIME_REWARD
+                            total_flight_hours += flight_time_hours
+                        total_duty_days += 1
+                    elif hasattr(duty, 'crewId') and hasattr(duty, 'airport'):
+                        covered_ground_duties.add(duty.id)
+                        total_duty_days += 1
 
-            # 简化的成本计算（主要组成部分）
-            roster_cost = flight_reward - positioning_penalty - overnight_penalty
-            roster_cost_sum += roster_cost
+                # 简化的成本计算（主要组成部分）
+                roster_cost = flight_reward - positioning_penalty - overnight_penalty
+                roster_cost_sum += roster_cost
 
-        # 计算未覆盖惩罚
-        uncovered_flights = len(self.flights) - len(covered_flights)
-        uncovered_ground_duties = len(self.ground_duties) - len(covered_ground_duties)
+            # 计算未覆盖惩罚
+            uncovered_flights = len(self.flights) - len(covered_flights)
+            uncovered_ground_duties = len(self.ground_duties) - len(covered_ground_duties)
 
-        uncovered_flight_penalty = uncovered_flights * UnifiedConfig.UNCOVERED_FLIGHT_PENALTY
-        uncovered_ground_duty_penalty = uncovered_ground_duties * UnifiedConfig.UNCOVERED_GROUND_DUTY_PENALTY
+            uncovered_flight_penalty = uncovered_flights * UnifiedConfig.UNCOVERED_FLIGHT_PENALTY
+            uncovered_ground_duty_penalty = uncovered_ground_duties * UnifiedConfig.UNCOVERED_GROUND_DUTY_PENALTY
 
-        # 总目标函数值（最小化）
-        self.objective_value = roster_cost_sum + uncovered_flight_penalty + uncovered_ground_duty_penalty
+            # 总目标函数值（最小化）
+            self.objective_value = roster_cost_sum + uncovered_flight_penalty + uncovered_ground_duty_penalty
 
-        # 计算覆盖率
-        self.coverage_rate = len(covered_flights) / len(self.flights) if self.flights else 0.0
-        self.ground_duty_coverage_rate = len(covered_ground_duties) / len(self.ground_duties) if self.ground_duties else 0.0
+            # 计算覆盖率
+            self.coverage_rate = len(covered_flights) / len(self.flights) if self.flights else 0.0
+            self.ground_duty_coverage_rate = len(covered_ground_duties) / len(self.ground_duties) if self.ground_duties else 0.0
 
     def copy(self):
         """创建解的深拷贝"""
@@ -115,7 +116,7 @@ class ALNSSolution:
                 f"rosters={len(self.rosters)}, "
                 f"feasible={self.is_feasible})")
 
-
+    
 class DestroyOperator:
     """破坏算子基类"""
 
@@ -208,18 +209,34 @@ class WorstRosterDestroy(DestroyOperator):
         super().__init__("WorstRosterDestroy")
 
     def destroy(self, solution: ALNSSolution, destroy_size: int) -> Tuple[ALNSSolution, List[Roster]]:
-        """移除成本最高的roster"""
+        """移除成本效益比最差的roster"""
         new_solution = solution.copy()
 
         if len(new_solution.rosters) <= destroy_size:
             destroy_size = max(1, len(new_solution.rosters) - 1)
 
-        # 按成本排序，选择成本最高的roster
-        sorted_rosters = sorted(new_solution.rosters,
-                               key=lambda r: getattr(r, 'cost', 0),
-                               reverse=True)
+        # 计算每个roster的成本效益比
+        roster_scores = []
+        for roster in new_solution.rosters:
+            # 计算roster的负面影响：成本高、覆盖任务少、违规多
+            cost = getattr(roster, 'cost', 0)
+            task_count = len(roster.duties)
+            flight_count = sum(1 for duty in roster.duties if isinstance(duty, Flight))
 
-        removed_rosters = sorted_rosters[:destroy_size]
+            # 成本效益比：成本越高、覆盖任务越少，分数越高（越差）
+            if task_count > 0:
+                cost_per_task = cost / task_count
+                # 如果没有航班任务，额外惩罚
+                if flight_count == 0:
+                    cost_per_task += 1000
+            else:
+                cost_per_task = float('inf')
+
+            roster_scores.append((cost_per_task, roster))
+
+        # 按成本效益比排序，选择最差的
+        roster_scores.sort(key=lambda x: x[0], reverse=True)
+        removed_rosters = [roster for _, roster in roster_scores[:destroy_size]]
 
         # 从解中移除选中的roster
         for roster in removed_rosters:
@@ -382,7 +399,9 @@ class GreedyRepair(RepairOperator):
                     break
 
         if selected_tasks:
-            roster = Roster(crew.crewId, selected_tasks)
+            # 计算roster的成本
+            cost = sum(getattr(task, 'cost', 0) for task in selected_tasks)
+            roster = Roster(crew.crewId, selected_tasks, cost)
             return roster
 
         return None
@@ -408,6 +427,219 @@ class GreedyRepair(RepairOperator):
                     return False
 
         return True
+
+
+class GurobiRepair(RepairOperator):
+    """基于Gurobi MILP求解的修复算子"""
+
+    def __init__(self, crews: List[Crew], flights: List[Flight],
+                 ground_duties: List[GroundDuty], bus_info: List[BusInfo],
+                 crew_leg_match_dict: Dict, layover_stations: Set[str]):
+        super().__init__("GurobiRepair")
+        self.crews = crews
+        self.flights = flights
+        self.ground_duties = ground_duties
+        self.bus_info = bus_info
+        self.crew_leg_match_dict = crew_leg_match_dict
+        self.layover_stations = layover_stations
+
+        # 准备全局数据
+        self.all_data = {
+            'flights': flights,
+            'ground_duties': ground_duties,
+            'bus_info': bus_info,
+            'crews': crews
+        }
+
+        # 初始化Gurobi求解器
+        self.gurobi_solver = GurobiRepairSolver(self.all_data, layover_stations)
+
+        # 备用贪心修复器（当Gurobi失败时使用）
+        self.greedy_repair = GreedyRepair(crews, flights, ground_duties, bus_info,
+                                        crew_leg_match_dict, layover_stations)
+
+    def repair(self, solution: ALNSSolution, removed_rosters: List[Roster]) -> ALNSSolution:
+        """使用Gurobi MILP求解器修复解决方案 - 正确的ALNS逻辑"""
+        new_solution = solution.copy()
+
+        # **正确的ALNS逻辑**：
+        # 1. 获取所有需要重新分配的任务（未覆盖 + 被移除的）
+        uncovered_tasks = self._get_uncovered_tasks(new_solution)
+
+        removed_tasks = []
+        for roster in removed_rosters:
+            removed_tasks.extend(roster.duties)
+
+        # 合并所有需要分配的任务
+        all_tasks_to_assign = uncovered_tasks.copy()
+        for task in removed_tasks:
+            task_id = getattr(task, 'id', str(task))
+            if not any(getattr(t, 'id', str(t)) == task_id for t in all_tasks_to_assign):
+                all_tasks_to_assign.append(task)
+
+        print(f"ALNS修复: 需要重新分配{len(all_tasks_to_assign)}个任务 (未覆盖{len(uncovered_tasks)} + 被移除{len(removed_tasks)})")
+
+        # 2. 获取所有可用的机组（包括被移除rosters的机组）
+        available_crews = self._get_available_crews(new_solution, removed_rosters)
+        print(f"可用机组: {len(available_crews)}个")
+
+        # **关键**：不进行任何直接恢复，让Gurobi重新优化所有任务分配
+
+        # 3. 使用Gurobi为每个可用机组重新优化任务分配
+        successful_repairs = 0
+        total_repairs = 0
+
+        for crew in available_crews:
+            if not all_tasks_to_assign:
+                break
+
+            total_repairs += 1
+
+            # 获取该机组可执行的任务
+            candidate_tasks = self._get_candidate_tasks_for_crew(crew, all_tasks_to_assign)
+
+            if not candidate_tasks:
+                continue
+
+            print(f"为机组{crew.crewId}求解: {len(candidate_tasks)}个候选任务")
+
+            # 准备修复输入
+            repair_input = self._prepare_repair_input(crew, candidate_tasks, new_solution)
+
+            # 调用Gurobi求解器
+            result = self.gurobi_solver.solve_local_problem(repair_input, removed_tasks)
+
+            if result.is_feasible and result.new_duties:
+                # 创建新的roster
+                new_roster = Roster(crew.crewId, result.new_duties, result.cost)
+                new_solution.rosters.append(new_roster)
+
+                # 从待分配任务中移除已分配的任务
+                all_tasks_to_assign = self._remove_covered_tasks(all_tasks_to_assign, result.new_duties)
+                successful_repairs += 1
+
+                print(f"Gurobi成功为机组{crew.crewId}分配{len(result.new_duties)}个任务，成本{result.cost:.2f}")
+            else:
+                # Gurobi求解失败，尝试简单的贪心方法
+                simple_roster = self._create_simple_roster_for_crew(crew, candidate_tasks[:3])
+                if simple_roster:
+                    new_solution.rosters.append(simple_roster)
+                    all_tasks_to_assign = self._remove_covered_tasks(all_tasks_to_assign, simple_roster.duties)
+                    print(f"贪心为机组{crew.crewId}分配{len(simple_roster.duties)}个任务")
+
+        # 4. 如果还有未分配的任务，使用贪心修复作为补充
+        if all_tasks_to_assign:
+            print(f"剩余{len(all_tasks_to_assign)}个未分配任务，使用贪心修复补充")
+            # 创建一个临时的removed_rosters来传递给贪心修复
+            temp_removed = []
+            new_solution = self.greedy_repair.repair(new_solution, temp_removed)
+
+        new_solution._calculate_objective()
+
+        print(f"ALNS修复完成: Gurobi成功{successful_repairs}/{total_repairs}, 最终解{new_solution}")
+        return new_solution
+
+    def _get_uncovered_tasks(self, solution: ALNSSolution) -> List[Any]:
+        """获取当前解中未覆盖的任务"""
+        covered_flight_ids = set()
+        covered_ground_duty_ids = set()
+
+        for roster in solution.rosters:
+            for duty in roster.duties:
+                if isinstance(duty, Flight):
+                    covered_flight_ids.add(duty.id)
+                elif hasattr(duty, 'crewId') and hasattr(duty, 'airport'):
+                    covered_ground_duty_ids.add(duty.id)
+
+        uncovered_tasks = []
+        uncovered_tasks.extend([f for f in self.flights if f.id not in covered_flight_ids])
+        uncovered_tasks.extend([gd for gd in self.ground_duties if gd.id not in covered_ground_duty_ids])
+
+        return uncovered_tasks
+
+    def _get_available_crews(self, solution: ALNSSolution, removed_rosters: List[Roster]) -> List[Crew]:
+        """获取可用的机组"""
+        assigned_crew_ids = {roster.crew_id for roster in solution.rosters}
+        available_crews = [crew for crew in self.crews if crew.crewId not in assigned_crew_ids]
+
+        # 优先考虑被移除roster的机组
+        removed_crew_ids = {roster.crew_id for roster in removed_rosters}
+        priority_crews = [crew for crew in available_crews if crew.crewId in removed_crew_ids]
+        other_crews = [crew for crew in available_crews if crew.crewId not in removed_crew_ids]
+
+        return priority_crews + other_crews
+
+    def _get_candidate_tasks_for_crew(self, crew: Crew, uncovered_tasks: List[Any]) -> List[Any]:
+        """获取机组可执行的候选任务"""
+        candidate_tasks = []
+
+        # 获取该机组可执行的航班
+        eligible_flight_ids = self.crew_leg_match_dict.get(crew.crewId, [])
+        for task in uncovered_tasks:
+            if isinstance(task, Flight) and task.id in eligible_flight_ids:
+                candidate_tasks.append(task)
+            elif hasattr(task, 'crewId') and task.crewId == crew.crewId:
+                candidate_tasks.append(task)
+
+        # 按时间排序
+        candidate_tasks.sort(key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
+
+        # 动态调整候选任务数量：根据任务类型和重要性
+        flight_tasks = [t for t in candidate_tasks if isinstance(t, Flight)]
+        ground_tasks = [t for t in candidate_tasks if not isinstance(t, Flight)]
+
+        # 优先保留航班任务，限制地面任务
+        max_flights = min(30, len(flight_tasks))  # 最多30个航班
+        max_ground = min(10, len(ground_tasks))   # 最多10个地面任务
+
+        selected_tasks = flight_tasks[:max_flights] + ground_tasks[:max_ground]
+        selected_tasks.sort(key=lambda x: getattr(x, 'std', getattr(x, 'startTime', datetime.min)))
+
+        return selected_tasks
+
+    def _prepare_repair_input(self, crew: Crew, candidate_tasks: List[Any],
+                             solution: ALNSSolution) -> RepairInput:
+        """准备Gurobi求解器的输入"""
+        # 确定时间窗口
+        if candidate_tasks:
+            min_time = min(getattr(task, 'std', getattr(task, 'startTime', datetime.max))
+                          for task in candidate_tasks)
+            max_time = max(getattr(task, 'sta', getattr(task, 'endTime', datetime.min))
+                          for task in candidate_tasks)
+            time_window = (min_time - timedelta(hours=1), max_time + timedelta(hours=1))
+        else:
+            now = datetime.now()
+            time_window = (now, now + timedelta(days=1))
+
+        # 初始状态
+        initial_state = {
+            'location': crew.stayStation,
+            'time': time_window[0]
+        }
+
+        return RepairInput(
+            crew=crew,
+            candidate_tasks=candidate_tasks,
+            time_window=time_window,
+            initial_state=initial_state,
+            current_solution_rosters=solution.rosters
+        )
+
+    def _remove_covered_tasks(self, uncovered_tasks: List[Any], new_duties: List[Any]) -> List[Any]:
+        """从未覆盖任务列表中移除已被覆盖的任务"""
+        covered_ids = {getattr(duty, 'id', str(duty)) for duty in new_duties}
+        return [task for task in uncovered_tasks if getattr(task, 'id', str(task)) not in covered_ids]
+
+    def _create_simple_roster_for_crew(self, crew: Crew, candidate_tasks: List[Any]) -> Optional[Roster]:
+        """为机组创建简单的roster（备用方法）"""
+        if not candidate_tasks:
+            return None
+
+        # 选择第一个可行的任务
+        selected_task = candidate_tasks[0]
+        cost = getattr(selected_task, 'cost', 0)
+
+        return Roster(crew.crewId, [selected_task], cost)
 
 
 class RandomRepair(RepairOperator):
@@ -530,17 +762,13 @@ class ALNSAlgorithm:
         self.crew_leg_match_dict = crew_leg_match_dict
         self.layover_stations = layover_stations
 
-        # 初始化算子
+        # 初始化算子 - 只使用WorstRosterDestroy和GurobiRepair
         self.destroy_operators = [
-            RandomRosterDestroy(),
-            WorstRosterDestroy(),
-            RelatedFlightDestroy()
+            WorstRosterDestroy()
         ]
 
         self.repair_operators = [
-            GreedyRepair(crews, flights, ground_duties, bus_info,
-                        crew_leg_match_dict, layover_stations),
-            RandomRepair(crews, flights, ground_duties, bus_info,
+            GurobiRepair(crews, flights, ground_duties, bus_info,
                         crew_leg_match_dict, layover_stations)
         ]
 
@@ -549,21 +777,26 @@ class ALNSAlgorithm:
         self.repair_weight_manager = AdaptiveWeightManager(self.repair_operators)
 
         # 算法参数
-        self.max_iterations = 1000
-        self.time_limit = 3600  # 1小时
-        self.destroy_size_min = 1
-        self.destroy_size_max = 5
+        self.max_iterations = float('inf')  # 无限迭代
+        self.time_limit = 3600  # 恢复1小时运行
+        self.destroy_size_min = 2  # 增加最小破坏大小
+        self.destroy_size_max = min(10, max(5, len(crews) // 4))  # 动态调整最大破坏大小
 
-        # 模拟退火参数
-        self.initial_temperature = 1000.0
-        self.cooling_rate = 0.995
-        self.min_temperature = 1.0
+        # 模拟退火参数 - 调整为更慢的冷却
+        self.initial_temperature = 5000.0  # 增加初始温度
+        self.cooling_rate = 0.9995  # 更慢的冷却速度
+        self.min_temperature = 0.1  # 降低最小温度
 
         # 统计信息
         self.iteration_count = 0
         self.best_solution = None
         self.current_solution = None
         self.temperature = self.initial_temperature
+
+        # 多样化策略
+        self.last_improvement_iteration = 0
+        self.stagnation_limit = 100  # 100次迭代无改进后增加多样化
+        self.diversification_factor = 1.0
 
         # 验证器
         self.coverage_validator = CoverageValidator(min_coverage_rate=0.8)
@@ -580,22 +813,25 @@ class ALNSAlgorithm:
 
         print(f"初始解: {self.current_solution}")
 
-        # 主循环
-        for iteration in range(self.max_iterations):
+        # 主循环 - 只受时间限制约束
+        iteration = 0
+        while True:
             self.iteration_count = iteration
 
             # 检查时间限制
             if time.time() - start_time > self.time_limit:
-                print(f"达到时间限制，算法终止")
+                print(f"达到时间限制({self.time_limit}秒)，算法终止")
                 break
 
             # 选择破坏和修复算子
             destroy_op = self.destroy_weight_manager.select_operator()
             repair_op = self.repair_weight_manager.select_operator()
 
-            # 确定破坏大小
-            destroy_size = random.randint(self.destroy_size_min,
-                                        min(self.destroy_size_max, len(self.current_solution.rosters)))
+            # 确定破坏大小（考虑多样化因子）
+            base_destroy_size = random.randint(self.destroy_size_min,
+                                             min(self.destroy_size_max, len(self.current_solution.rosters)))
+            destroy_size = min(len(self.current_solution.rosters) - 1,
+                             int(base_destroy_size * self.diversification_factor))
 
             try:
                 # 破坏
@@ -619,7 +855,17 @@ class ALNSAlgorithm:
                     # 更新最优解
                     if new_solution.is_better_than(self.best_solution):
                         self.best_solution = new_solution.copy()
+                        self.last_improvement_iteration = iteration
                         print(f"迭代 {iteration}: 找到更好解 {self.best_solution}")
+
+                # 多样化策略：如果长时间无改进，增加破坏大小和温度
+                if iteration - self.last_improvement_iteration > self.stagnation_limit:
+                    self.diversification_factor = min(2.0, self.diversification_factor * 1.1)
+                    # 重置温度以增加接受概率
+                    self.temperature = max(self.temperature, self.initial_temperature * 0.1)
+                    print(f"迭代 {iteration}: 启动多样化策略，因子={self.diversification_factor:.2f}")
+                else:
+                    self.diversification_factor = max(1.0, self.diversification_factor * 0.99)
 
                 # 更新温度
                 self.temperature = max(self.min_temperature,
@@ -641,6 +887,9 @@ class ALNSAlgorithm:
             except Exception as e:
                 print(f"迭代 {iteration} 出错: {e}")
                 continue
+
+            # 增加迭代计数器
+            iteration += 1
 
         print(f"ALNS算法完成，总迭代次数: {self.iteration_count + 1}")
         print(f"最优解: {self.best_solution}")
